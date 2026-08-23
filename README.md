@@ -1,6 +1,16 @@
 # pg-guard-mcp
 
+[![PyPI](https://img.shields.io/pypi/v/pg-guard-mcp.svg)](https://pypi.org/project/pg-guard-mcp/)
+
 A PostgreSQL MCP server that enforces read-only access at the **protocol and privilege level** — not by parsing the query string and hoping.
+
+## Install
+
+```bash
+pip install pg-guard-mcp
+# or, without installing anything permanently:
+uvx pg-guard-mcp
+```
 
 ## Why this exists
 
@@ -27,10 +37,12 @@ On top of that, connecting with a database role that has had write privileges `R
 ## Setup
 
 ```bash
-pip install -e ".[dev]"
+pip install pg-guard-mcp
 export PG_GUARD_DSN="host=127.0.0.1 dbname=mydb user=myapp_readonly password=..."
-python -m pg_guard_mcp.server
+pg-guard-mcp
 ```
+
+Point your MCP client at the `pg-guard-mcp` command (or `uvx pg-guard-mcp` to skip a permanent install) with `PG_GUARD_DSN` set in its env config.
 
 See `.env.example` for all supported environment variables, and `scripts/setup_dev_db.sh` for a working example of setting up a properly-restricted read-only role (the setup this project's own tests run against).
 
@@ -45,7 +57,7 @@ pytest tests/ -v
 
 ## Status
 
-Early build, 58 passing tests (unit + live-Postgres integration). Not yet published to PyPI.
+v0.1.0, live on PyPI. 58 passing tests (unit + live-Postgres integration, including the exact exploit that deprecated the official server-postgres, run against a fresh `pip install` of the published package).
 
 ## License
 
