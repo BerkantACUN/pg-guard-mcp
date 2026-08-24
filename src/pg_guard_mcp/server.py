@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import sys
+from pathlib import Path
 
 try:
     # SDK >= 2.0: FastMCP was renamed to MCPServer, same .tool()/.run() API.
@@ -21,9 +22,15 @@ except ImportError:  # SDK < 2.0
     from mcp.server.fastmcp import FastMCP as _MCPServerImpl  # type: ignore[no-redef]
 
 from .db import DEFAULT_ROW_LIMIT, DEFAULT_STATEMENT_TIMEOUT_MS, ReadOnlyConnection
+from .migration_safety import check_migration_safety
 from .safety import UnsafeQueryError, validate_readonly_query
 
 mcp = _MCPServerImpl("pg-guard-mcp")
+
+# Real migration files are a few KB. Generous ceiling, not a tight budget —
+# rejects an oversized input with a clear typed error before it's ever
+# handed to the regex-based rule engine, as defense in depth.
+_MAX_MIGRATION_BYTES = 2 * 1024 * 1024  # 2 MiB
 
 
 def _dsn() -> str:
@@ -137,6 +144,126 @@ def pg_describe_table(table_name: str, schema: str = "public") -> dict:
         "ORDER BY ordinal_position",
         (schema, table_name),
     )
+
+
+def _too_large_error(size: int) -> dict:
+    return {
+        "error": "MigrationTooLarge",
+        "message": f"{size} bytes exceeds the {_MAX_MIGRATION_BYTES}-byte limit for a migration.",
+    }
+
+
+def _check_migration_sql(sql: str) -> dict:
+    """Shared by both migration tools below. Wraps the rule-engine call
+    itself in the same catch-all shape every other tool in this file gets
+    from _run() — a future bug in the regex engine should surface as a
+    typed {"error": ...} response at the MCP boundary, not an unhandled
+    exception, even though this path never touches ReadOnlyConnection."""
+    try:
+        findings = check_migration_safety(sql)
+    except Exception as e:  # pragma: no cover - defense in depth, see docstring
+        return {"error": type(e).__name__, "message": str(e)}
+    return {
+        "findings": [f.to_dict() for f in findings],
+        "finding_count": len(findings),
+    }
+
+
+@mcp.tool()
+def pg_check_migration_safety(sql: str) -> dict:
+    """Statically check DDL (CREATE INDEX, ALTER TABLE ADD/RENAME/ALTER
+    COLUMN TYPE, ADD CONSTRAINT) for lock/downtime/breakage patterns that
+    cause real production incidents on a table that already has traffic —
+    a missing CONCURRENTLY, a FOREIGN KEY added without NOT VALID, a
+    NOT NULL column added with no DEFAULT, an in-place RENAME, and similar.
+    Pure text analysis — never connects to the database, never runs
+    anything. An empty findings list means no known-unsafe pattern was
+    found, not a guarantee the migration is safe; see the rule engine's
+    module docstring for what this does and doesn't cover."""
+    size = len(sql.encode("utf-8"))
+    if size > _MAX_MIGRATION_BYTES:
+        return _too_large_error(size)
+    return _check_migration_sql(sql)
+
+
+def _migrations_dir() -> Path | None:
+    """Optional containment root for pg_check_migration_file, set via
+    PG_GUARD_MIGRATIONS_DIR. Unset by default: this tool reads whatever
+    path it's given, same as every other MCP filesystem-read tool in this
+    session's "guard" family (actions-guard-mcp's scan_workflow_file has
+    the identical shape). But that's a real, separate capability from
+    "read-only Postgres access" — the one thing this whole project exists
+    to guarantee elsewhere — so a user who wants this tool confined to a
+    known migrations folder can set this and get it, without changing the
+    permissive default anyone upgrading from an earlier version relies on.
+    """
+    raw = os.environ.get("PG_GUARD_MIGRATIONS_DIR")
+    return Path(raw).resolve() if raw else None
+
+
+def _looks_like_unc_path(path: str) -> bool:
+    """True for a UNC network path (\\\\host\\share\\...), including the
+    \\\\?\\UNC\\ extended-length form and its forward-slash spelling
+    (//host/share/...). A stat()/is_file()/resolve() call on one of these
+    can force an outbound SMB/NTLM authentication attempt to whatever
+    host the string names — independent of anything this function does,
+    a well-known Windows "forced authentication" primitive — and a
+    real security review measured ~21s hung against a single
+    unreachable address before returning. Rejected outright, before any
+    Path method ever touches the string, rather than after. A genuine
+    single leading backslash (a drive-relative local path) is unaffected
+    — this only matches a *double* leading separator."""
+    return path.replace("/", "\\").startswith("\\\\")
+
+
+@mcp.tool()
+def pg_check_migration_file(path: str) -> dict:
+    """Same as pg_check_migration_safety, reading the SQL from a file on
+    disk instead of inline content. Confined to PG_GUARD_MIGRATIONS_DIR
+    when that's set; otherwise reads any local path this process can
+    access — see _migrations_dir()'s docstring. UNC network paths are
+    always rejected, configured or not."""
+    if _looks_like_unc_path(path):
+        return {
+            "error": "UnsupportedPath",
+            "message": f"UNC network paths are not supported: {path}",
+        }
+
+    try:
+        file_path = Path(path)
+        migrations_dir = _migrations_dir()
+        if migrations_dir is not None:
+            resolved = file_path.resolve()
+            if not resolved.is_relative_to(migrations_dir):
+                return {
+                    "error": "PathOutsideMigrationsDir",
+                    "message": (
+                        f"{path} resolves outside PG_GUARD_MIGRATIONS_DIR ({migrations_dir})."
+                    ),
+                }
+            file_path = resolved
+
+        if not file_path.is_file():
+            return {"error": "FileNotFoundError", "message": f"No such file: {path}"}
+
+        size = file_path.stat().st_size
+        if size > _MAX_MIGRATION_BYTES:
+            return _too_large_error(size)
+        sql = file_path.read_text(encoding="utf-8")
+    except OSError as e:
+        # Deliberately one try/except spanning every filesystem call in
+        # this function, is_file() included: is_file() only swallows a
+        # narrow set of OSError codes internally (ENOENT/ENOTDIR/EBADF
+        # and their Windows equivalents) and re-raises the rest —
+        # PermissionError ("Access is denied") is one of the ones that
+        # gets re-raised. A real security review confirmed that with
+        # is_file() outside this block, a permission-denied path crashed
+        # this tool with an unhandled exception instead of returning the
+        # same typed {"error": ...} shape every other failure here does.
+        return {"error": type(e).__name__, "message": str(e)}
+    except UnicodeDecodeError as e:
+        return {"error": "UnicodeDecodeError", "message": str(e)}
+    return _check_migration_sql(sql)
 
 
 def _warn_if_role_can_write() -> None:

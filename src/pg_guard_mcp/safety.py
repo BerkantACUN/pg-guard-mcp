@@ -20,7 +20,12 @@ from __future__ import annotations
 
 import re
 
-__all__ = ["UnsafeQueryError", "validate_readonly_query"]
+__all__ = [
+    "UnsafeQueryError",
+    "validate_readonly_query",
+    "mask_sql",
+    "split_sql_statements",
+]
 
 
 class UnsafeQueryError(ValueError):
@@ -154,6 +159,15 @@ def _split_statements(sql: str, masked: str) -> list[tuple[str, str]]:
             start = i + 1
     pairs.append((sql[start:], masked[start:]))
     return pairs
+
+
+# Public names for the two pieces of this module that are generically
+# useful beyond read-only validation — migration_safety.py reuses this
+# exact masking/splitting logic (already hardened here) rather than
+# re-implementing "which semicolons are real statement boundaries" a
+# second time.
+mask_sql = _mask
+split_sql_statements = _split_statements
 
 
 def validate_readonly_query(sql: str) -> None:

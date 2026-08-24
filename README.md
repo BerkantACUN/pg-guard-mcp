@@ -33,6 +33,42 @@ On top of that, connecting with a database role that has had write privileges `R
 | `pg_list_tables(schema="public")` | List tables/views in a schema |
 | `pg_describe_table(table_name, schema="public")` | List a table's columns |
 | `pg_check_privileges()` | Report any write grant the connected role actually holds — should always come back empty |
+| `pg_check_migration_safety(sql)` | Static-check DDL for lock/downtime/breakage patterns *before* anyone runs it — never touches the database |
+| `pg_check_migration_file(path)` | Same check, reading the SQL from a file on disk |
+
+### Migration safety linting
+
+An agent asked to "add this migration and run it" is exactly the moment a
+`CREATE INDEX` without `CONCURRENTLY` locks writes on a busy table for the
+next ten minutes, or an `ADD COLUMN ... NOT NULL` with no default fails
+outright the instant it hits a populated table. `pg_check_migration_safety`
+and `pg_check_migration_file` catch these *before* they run — pure text
+analysis, no database connection involved, so they work with no `PG_GUARD_DSN`
+configured at all.
+
+This is the same rule class as [Squawk](https://squawkhq.com) and
+[strong_migrations](https://github.com/ankane/strong_migrations), which
+exist as standalone linters but not, as far as a deliberate search turned
+up, as an MCP tool an agent can call mid-conversation:
+
+| Rule | Catches |
+|---|---|
+| `PGGUARD-M01` | `CREATE INDEX` without `CONCURRENTLY` — locks writes for the whole build |
+| `PGGUARD-M02` | `ADD CONSTRAINT ... FOREIGN KEY` without `NOT VALID` — scans + locks both tables |
+| `PGGUARD-M03` | `ADD CONSTRAINT ... UNIQUE`/`PRIMARY KEY` without `USING INDEX` — locks while building the index in place |
+| `PGGUARD-M04` | `ALTER COLUMN ... TYPE` — usually rewrites the whole table under an exclusive lock |
+| `PGGUARD-M05` | `ADD COLUMN ... NOT NULL` with no `DEFAULT` — fails outright on a populated table |
+| `PGGUARD-M06` | `RENAME COLUMN`/`RENAME TABLE` — breaks in-flight app code from a rolling deploy |
+| `PGGUARD-M07` | `ADD CONSTRAINT ... CHECK` without `NOT VALID` — scans + locks the table |
+
+This is regex-based pattern matching over one statement at a time, not a
+real SQL parser — see `migration_safety.py`'s module docstring for the
+exact scope limitation (a single hand-written statement combining several
+actions in one comma-separated `ALTER TABLE` is checked as a whole, not
+action-by-action; every common migration tool generates one action per
+statement by default, so this covers the overwhelming majority of
+real-world migrations). An empty findings list means no known-unsafe
+pattern was found, not a guarantee.
 
 ## Setup
 
@@ -57,7 +93,7 @@ pytest tests/ -v
 
 ## Status
 
-v0.1.0, live on PyPI. 58 passing tests (unit + live-Postgres integration, including the exact exploit that deprecated the official server-postgres, run against a fresh `pip install` of the published package).
+v0.2.0. 99 passing tests (unit + live-Postgres integration, including the exact exploit that deprecated the official server-postgres, run against a fresh `pip install` of the published package) plus 16 DB-dependent tests that skip automatically without a local `pgguard_test` database.
 
 ## License
 
