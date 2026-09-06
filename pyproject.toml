@@ -4,7 +4,8 @@ version = "0.2.0"
 description = "A PostgreSQL MCP server that enforces read-only access at the protocol and privilege level — not by parsing the query string."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "MIT" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [{ name = "Berkant Acun" }]
 keywords = ["mcp", "model-context-protocol", "postgresql", "postgres", "read-only", "security"]
 dependencies = [
